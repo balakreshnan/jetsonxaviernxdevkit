@@ -252,8 +252,8 @@ python3 -u yolo_person.py --cam 0 --save               # different camera
 |--------|-------|-------|
 | All objects (chair, laptop, cup, dog, …) | YOLO11n | 80 COCO classes, counted per class |
 | Person activity: `active`, `still / resting`, `lying / sleeping?` | YOLO11n-pose | From torso angle and movement between checks |
-| Facial expression: neutral, happy, surprised, sad, angry, disgusted, fearful, contempt | emotion-ferplus (ONNX, 64×64) | Face located from pose keypoints; needs a roughly frontal face ≥ 40 px |
-| GPU %, GPU temp, CUDA memory, RAM % | jtop + torch | On every summary line |
+| Facial expression: neutral, happy, surprised, sad, angry, disgusted, fearful, contempt | emotion-ferplus (ONNX, 64×64, run with OpenCV DNN) | Face located from pose keypoints; needs a roughly frontal face ≥ 40 px |
+| Peak GPU %, GPU temp, CUDA memory, RAM % | jtop + torch | On every summary line; GPU % is the peak over the whole interval |
 
 How states are decided:
 
@@ -263,8 +263,10 @@ How states are decided:
 
 ## Extra setup
 
+No extra Python packages beyond Part 1 and `jetson-stats` — the expression model runs through OpenCV's built-in DNN module (onnxruntime is deliberately not used; see Troubleshooting).
+
 ```bash
-pip3 install onnxruntime jetson-stats
+pip3 install "jetson-stats==4.3.2"
 cd ~/projects/led
 wget -O emotion-ferplus-8.onnx https://github.com/onnx/models/raw/main/validated/vision/body_analysis/emotion_ferplus/model/emotion-ferplus-8.onnx
 python3 -c "from ultralytics import YOLO; YOLO('yolo11n-pose.pt')"      # downloads the pose model
@@ -284,8 +286,8 @@ cat > yolo_scene.py << 'EOF2'
 Scene understanding from a USB camera on Jetson Xavier NX, every INTERVAL seconds:
   - all objects (YOLO11n)
   - per person: posture/activity from keypoints (YOLO11n-pose)
-  - per person: facial expression (emotion-ferplus ONNX) if the face is visible
-  - GPU utilisation, temperature and CUDA memory on every summary line (jtop)
+  - per person: facial expression (emotion-ferplus ONNX via OpenCV DNN) if the face is visible
+  - peak GPU utilisation, temperature and CUDA memory on every summary line (jtop)
 Prints a summary and writes latest.jpg (or shows a window).
 """
 import argparse
@@ -311,12 +313,13 @@ def load_emotion_model(path):
         log('Emotion model {} not found - sentiment disabled'.format(path))
         return None
     try:
-        import onnxruntime as ort
-        sess = ort.InferenceSession(path, providers=['CPUExecutionProvider'])
-        log('Emotion model loaded ({})'.format(path))
-        return sess
+        net = cv2.dnn.readNetFromONNX(path)
+        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        log('Emotion model loaded via OpenCV DNN ({})'.format(path))
+        return net
     except Exception as e:
-        log('onnxruntime unavailable ({}) - sentiment disabled'.format(e))
+        log('Could not load emotion model ({}) - sentiment disabled'.format(e))
         return None
 
 def face_crop(frame, kp, kc, box):
@@ -338,11 +341,12 @@ def face_crop(frame, kp, kc, box):
         return None, None
     return frame[ya:yb, xa:xb], (xa, ya, xb, yb)
 
-def emotion(sess, face):
+def emotion(net, face):
     gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, (64, 64)).astype(np.float32)
-    inp = gray.reshape(1, 1, 64, 64)
-    logits = sess.run(None, {sess.get_inputs()[0].name: inp})[0][0]
+    gray = cv2.resize(gray, (64, 64))
+    blob = cv2.dnn.blobFromImage(gray, scalefactor=1.0, size=(64, 64))   # 1x1x64x64 float32
+    net.setInput(blob)
+    logits = net.forward().flatten()
     p = np.exp(logits - logits.max()); p /= p.sum()
     i = int(p.argmax())
     return EMOTIONS[i], float(p[i])
@@ -433,11 +437,6 @@ def main():
     pose = YOLO(args.pose)
     emo = load_emotion_model(args.emo)
     log('Models loaded')
-    try:
-        log('Detector weights on: {}'.format(next(det.model.parameters()).device))
-        log('Pose weights on:     {}'.format(next(pose.model.parameters()).device))
-    except Exception:
-        log('Weights device: n/a (TensorRT engine)')
 
     log('Opening camera /dev/video{} ...'.format(args.cam))
     cap = cv2.VideoCapture(args.cam, cv2.CAP_V4L2)
@@ -454,9 +453,15 @@ def main():
     det.predict(frame, device=device, verbose=False, imgsz=640)
     pose.predict(frame, device=device, verbose=False, imgsz=640)
     log('Warm-up done in {:.1f} s'.format(time.time() - t0))
+    try:
+        log('Detector weights on: {}'.format(next(det.model.parameters()).device))
+        log('Pose weights on:     {}'.format(next(pose.model.parameters()).device))
+    except Exception:
+        log('Weights device: n/a (TensorRT engine)')
 
     prev_centers = []
     next_run = time.time()
+    gpu_peak = 0.0
     log('Analysing every {} s. CTRL+C to stop.'.format(args.interval))
     try:
         with jtop() as jetson:
@@ -464,6 +469,7 @@ def main():
                 ok, frame = cap.read()
                 if not ok:
                     time.sleep(0.5); continue
+                gpu_peak = max(gpu_peak, jetson.stats['GPU'])
                 if time.time() < next_run:
                     continue
                 next_run = time.time() + args.interval
@@ -474,17 +480,20 @@ def main():
                 ms = (time.time() - t0) * 1000
 
                 st = jetson.stats
+                gpu_peak = max(gpu_peak, st['GPU'])
                 gpu_mem = torch.cuda.memory_allocated() / 1e6 if device == 0 else 0
+                ram = st['RAM'] * 100 if st['RAM'] <= 1 else st['RAM']
                 obj_txt = ', '.join('{} x{}'.format(k, v) if v > 1 else k
                                     for k, v in sorted(objects.items())) or 'none'
-                log('{:.0f} ms | GPU {}% @ {:.0f}C | CUDA mem {:.0f} MB | RAM {}% | {} person(s) | objects: {}'.format(
-                    ms, st['GPU'], st['Temp GPU'], gpu_mem, st['RAM'], len(people), obj_txt))
+                log('{:.0f} ms | GPU peak {:.0f}% @ {:.0f}C | CUDA mem {:.0f} MB | RAM {:.0f}% | {} person(s) | objects: {}'.format(
+                    ms, gpu_peak, st['Temp GPU'], gpu_mem, ram, len(people), obj_txt))
                 for p in people:
                     log('   ' + p)
 
-                cv2.putText(annotated, '{} persons, {} objects | GPU {}%'.format(
-                    len(people), sum(objects.values()), st['GPU']),
+                cv2.putText(annotated, '{} persons, {} objects | GPU peak {:.0f}%'.format(
+                    len(people), sum(objects.values()), gpu_peak),
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                gpu_peak = 0.0
                 if args.save:
                     cv2.imwrite('latest.jpg', annotated)
                 else:
@@ -502,6 +511,31 @@ if __name__ == '__main__':
 EOF2
 ```
 
+## Power mode (do this before running)
+
+The Xavier NX ships in a low-power mode with only 2 CPU cores online, which halves inference speed and crashes some libraries. Switch to an all-core mode and max clocks:
+
+```bash
+sudo nvpmodel -q --verbose | grep -A1 "POWER_MODEL ID"   # list available modes
+sudo nvpmodel -m 2            # 15 W, 6 cores  (or -m 8 for 20 W, 6 cores if listed)
+sudo jetson_clocks
+nproc; cat /sys/devices/system/cpu/online                # want 6 and 0-5
+```
+
+Do **not** use `nvpmodel -m 0` — on the Xavier NX that is the 15 W **2-core** mode.
+
+If `nproc` still shows 2, bring the cores up directly:
+
+```bash
+for c in 2 3 4 5; do echo 1 | sudo tee /sys/devices/system/cpu/cpu$c/online; done
+```
+
+Make the mode persist across reboots (`jetson_clocks` itself is not persistent):
+
+```bash
+sudo nvpmodel -d 2
+```
+
 ## Run
 
 ```bash
@@ -512,24 +546,24 @@ python3 -u yolo_scene.py --save
 Expected output:
 
 ```
-[16:02:05] Torch 2.1.0a0+41361538.nv23.06  device: GPU Xavier
-[16:02:05] Loading models ...
-[16:02:08] Emotion model loaded (emotion-ferplus-8.onnx)
-[16:02:08] Models loaded
-[16:02:08] Detector weights on: cuda:0
-[16:02:08] Pose weights on:     cuda:0
-[16:02:08] Opening camera /dev/video1 ...
-[16:02:09] Camera OK, frame 640x480
-[16:02:09] Warming up GPU (first inference can take 30-90 s) ...
-[16:02:41] Warm-up done in 32.4 s
-[16:02:41] Analysing every 5.0 s. CTRL+C to stop.
-[16:02:46] 95 ms | GPU 62% @ 41C | CUDA mem 214 MB | RAM 48% | 1 person(s) | objects: chair x2, cup, laptop
-[16:02:46]    person 93% | active | happy 71%
-[16:02:51] 92 ms | GPU 58% @ 41C | CUDA mem 214 MB | RAM 48% | 1 person(s) | objects: chair x2, laptop
-[16:02:51]    person 91% | still / resting | neutral 64%
+[17:05:03] Torch 1.12.0a0+2c916ef.nv22.3  device: GPU Xavier
+[17:05:03] Loading models ...
+[17:05:04] Emotion model loaded via OpenCV DNN (emotion-ferplus-8.onnx)
+[17:05:04] Models loaded
+[17:05:04] Opening camera /dev/video1 ...
+[17:05:06] Camera OK, frame 640x480
+[17:05:06] Warming up GPU (first inference can take 30-90 s) ...
+[17:05:18] Warm-up done in 12.7 s
+[17:05:18] Detector weights on: cuda:0
+[17:05:18] Pose weights on:     cuda:0
+[17:05:18] Analysing every 5.0 s. CTRL+C to stop.
+[17:05:23] 118 ms | GPU peak 71% @ 48C | CUDA mem 22 MB | RAM 78% | 1 person(s) | objects: chair, cup, keyboard
+[17:05:23]    person 84% | active | neutral 89%
+[17:05:28] 105 ms | GPU peak 66% @ 48C | CUDA mem 22 MB | RAM 78% | 1 person(s) | objects: cup, keyboard, potted plant
+[17:05:28]    person 85% | still / resting | neutral 91%
 ```
 
-`Detector weights on: cuda:0` is the definitive proof the models are on the GPU. The GPU % is sampled right after inference, so it can read low on a fast frame; for a live view of load run `sudo jtop` (or `tegrastats --interval 1000` and watch `GR3D_FREQ`) in a second SSH window.
+`Detector weights on: cuda:0` (printed after warm-up, because Ultralytics only moves weights to the GPU on the first inference) is the definitive proof the models are on the GPU. `GPU peak` is the highest jtop reading seen during the whole interval, so it reflects the inference burst rather than the idle gap between checks. For a live view run `sudo jtop` (or `tegrastats --interval 1000` and watch `GR3D_FREQ`) in a second SSH window.
 
 In `latest.jpg`: other objects have YOLO's colored boxes and labels, each person has a green box labeled with state and expression, and a thin yellow square marks the face crop used for the expression estimate.
 
@@ -561,7 +595,7 @@ t=time.time(); [m.predict(img, device='cpu', verbose=False) for _ in range(3)]; 
 print('GPU {:.0f} ms/frame   CPU {:.0f} ms/frame   speed-up {:.1f}x'.format(g*1000, c*1000, c/g))"
 ```
 
-Expect roughly `GPU 35 ms / CPU 400 ms / 11x` on a Xavier NX. Near-equal numbers mean torch is not using CUDA — see the PyTorch install in Part 1.
+On this Xavier NX it printed `GPU 66 ms/frame   CPU 1795 ms/frame   speed-up 27.4x`. Near-equal numbers mean torch is not using CUDA — see the PyTorch install in Part 1.
 
 ---
 
@@ -607,6 +641,18 @@ Check `sudo jtop` — GPU should be active during inference. Confirm the `device
 
 **`Mismatch version jtop service` when starting `yolo_scene.py`**
 The jtop client and service differ. `sudo pip3 install "jetson-stats==4.3.2" && sudo systemctl restart jtop.service`, then rerun.
+
+**`Detector weights on: cpu` in the log**
+Only happens with an old version of the script that printed the device before warm-up. Ultralytics keeps weights on CPU until the first `predict()`; the current script checks after warm-up. `CUDA mem 22 MB` and the speed check above are the real indicators.
+
+**`GPU 0.0%` on every line**
+Old version of the script sampled jtop once, right after the 100–300 ms burst. The current script reports the peak over the interval. Use `sudo jtop` for a live view.
+
+**`pthread_setaffinity_np failed` / `Assertion '__n < this->size()' failed` / `Aborted (core dumped)` at "Loading models"**
+That is onnxruntime aborting on a Jetson with CPU cores offline (2-core power mode). Two fixes, both applied here: bring all cores online (see Power mode), and run the ONNX model through `cv2.dnn` instead of onnxruntime. If you still have onnxruntime installed, `pip3 uninstall -y onnxruntime` — the script does not need it.
+
+**`nproc` shows 2**
+The board is in a 2-core power mode (`nvpmodel -m 0` puts it there). See Power mode above.
 
 **Expression always "neutral" or missing**
 The face crop is too small or not frontal. Move closer to the camera (face ≥ 40 px wide) and face it; a thin yellow square in `latest.jpg` shows what the model saw.

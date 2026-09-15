@@ -2,8 +2,8 @@
 Scene understanding from a USB camera on Jetson Xavier NX, every INTERVAL seconds:
   - all objects (YOLO11n)
   - per person: posture/activity from keypoints (YOLO11n-pose)
-  - per person: facial expression (emotion-ferplus ONNX) if the face is visible
-  - GPU utilisation, temperature and CUDA memory on every summary line (jtop)
+  - per person: facial expression (emotion-ferplus ONNX via OpenCV DNN) if the face is visible
+  - peak GPU utilisation, temperature and CUDA memory on every summary line (jtop)
 Prints a summary and writes latest.jpg (or shows a window).
 """
 import argparse
@@ -29,12 +29,13 @@ def load_emotion_model(path):
         log('Emotion model {} not found - sentiment disabled'.format(path))
         return None
     try:
-        import onnxruntime as ort
-        sess = ort.InferenceSession(path, providers=['CPUExecutionProvider'])
-        log('Emotion model loaded ({})'.format(path))
-        return sess
+        net = cv2.dnn.readNetFromONNX(path)
+        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        log('Emotion model loaded via OpenCV DNN ({})'.format(path))
+        return net
     except Exception as e:
-        log('onnxruntime unavailable ({}) - sentiment disabled'.format(e))
+        log('Could not load emotion model ({}) - sentiment disabled'.format(e))
         return None
 
 def face_crop(frame, kp, kc, box):
@@ -56,11 +57,12 @@ def face_crop(frame, kp, kc, box):
         return None, None
     return frame[ya:yb, xa:xb], (xa, ya, xb, yb)
 
-def emotion(sess, face):
+def emotion(net, face):
     gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, (64, 64)).astype(np.float32)
-    inp = gray.reshape(1, 1, 64, 64)
-    logits = sess.run(None, {sess.get_inputs()[0].name: inp})[0][0]
+    gray = cv2.resize(gray, (64, 64))
+    blob = cv2.dnn.blobFromImage(gray, scalefactor=1.0, size=(64, 64))   # 1x1x64x64 float32
+    net.setInput(blob)
+    logits = net.forward().flatten()
     p = np.exp(logits - logits.max()); p /= p.sum()
     i = int(p.argmax())
     return EMOTIONS[i], float(p[i])
@@ -151,11 +153,6 @@ def main():
     pose = YOLO(args.pose)
     emo = load_emotion_model(args.emo)
     log('Models loaded')
-    try:
-        log('Detector weights on: {}'.format(next(det.model.parameters()).device))
-        log('Pose weights on:     {}'.format(next(pose.model.parameters()).device))
-    except Exception:
-        log('Weights device: n/a (TensorRT engine)')
 
     log('Opening camera /dev/video{} ...'.format(args.cam))
     cap = cv2.VideoCapture(args.cam, cv2.CAP_V4L2)
@@ -172,9 +169,15 @@ def main():
     det.predict(frame, device=device, verbose=False, imgsz=640)
     pose.predict(frame, device=device, verbose=False, imgsz=640)
     log('Warm-up done in {:.1f} s'.format(time.time() - t0))
+    try:
+        log('Detector weights on: {}'.format(next(det.model.parameters()).device))
+        log('Pose weights on:     {}'.format(next(pose.model.parameters()).device))
+    except Exception:
+        log('Weights device: n/a (TensorRT engine)')
 
     prev_centers = []
     next_run = time.time()
+    gpu_peak = 0.0
     log('Analysing every {} s. CTRL+C to stop.'.format(args.interval))
     try:
         with jtop() as jetson:
@@ -182,6 +185,7 @@ def main():
                 ok, frame = cap.read()
                 if not ok:
                     time.sleep(0.5); continue
+                gpu_peak = max(gpu_peak, jetson.stats['GPU'])
                 if time.time() < next_run:
                     continue
                 next_run = time.time() + args.interval
@@ -192,17 +196,20 @@ def main():
                 ms = (time.time() - t0) * 1000
 
                 st = jetson.stats
+                gpu_peak = max(gpu_peak, st['GPU'])
                 gpu_mem = torch.cuda.memory_allocated() / 1e6 if device == 0 else 0
+                ram = st['RAM'] * 100 if st['RAM'] <= 1 else st['RAM']
                 obj_txt = ', '.join('{} x{}'.format(k, v) if v > 1 else k
                                     for k, v in sorted(objects.items())) or 'none'
-                log('{:.0f} ms | GPU {}% @ {:.0f}C | CUDA mem {:.0f} MB | RAM {}% | {} person(s) | objects: {}'.format(
-                    ms, st['GPU'], st['Temp GPU'], gpu_mem, st['RAM'], len(people), obj_txt))
+                log('{:.0f} ms | GPU peak {:.0f}% @ {:.0f}C | CUDA mem {:.0f} MB | RAM {:.0f}% | {} person(s) | objects: {}'.format(
+                    ms, gpu_peak, st['Temp GPU'], gpu_mem, ram, len(people), obj_txt))
                 for p in people:
                     log('   ' + p)
 
-                cv2.putText(annotated, '{} persons, {} objects | GPU {}%'.format(
-                    len(people), sum(objects.values()), st['GPU']),
+                cv2.putText(annotated, '{} persons, {} objects | GPU peak {:.0f}%'.format(
+                    len(people), sum(objects.values()), gpu_peak),
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                gpu_peak = 0.0
                 if args.save:
                     cv2.imwrite('latest.jpg', annotated)
                 else:
