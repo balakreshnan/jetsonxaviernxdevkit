@@ -1,6 +1,7 @@
 """
 Scene understanding from a USB camera on Jetson Xavier NX:
   - every TRACK_INTERVAL (0.5 s): pose model with ByteTrack -> persistent person IDs, timers
+    (tracker IDs that are clearly the same person are merged, see PersonTracker)
   - every INTERVAL (5 s): all objects (YOLO11n), per-person activity, pose details,
     facial expression (emotion-ferplus via OpenCV DNN), visible-time per person,
     peak GPU utilisation / temperature / CUDA memory (jtop)
@@ -41,35 +42,74 @@ def gpu_load(jetson):
         v = jetson.stats.get('GPU', 0) or 0
         return v * 100 if v <= 1 else v
 
-class PersonTracker:
-    """Accumulates visible time per tracker ID."""
-    def __init__(self, gap_limit):
-        self.people = {}          # id -> dict(first, last, total, present, center)
-        self.gap_limit = gap_limit
+def iou(a, b):
+    ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
+    iw = max(0, min(ax2, bx2) - max(ax1, bx1)); ih = max(0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
 
-    def update(self, ids, centers, now):
+class PersonTracker:
+    """Accumulates visible time per person. Merges tracker IDs that are clearly the same person:
+    a new ID overlapping an existing track (duplicate box) or appearing where a recently
+    lost track was (ID switch) inherits that record instead of starting a new timer."""
+    def __init__(self, gap_limit, frame_w, reid_window=60.0):
+        self.people = {}          # canonical id -> record
+        self.alias = {}           # tracker id -> canonical id
+        self.gap_limit = gap_limit
+        self.W = frame_w
+        self.reid_window = reid_window
+
+    def resolve(self, tid):
+        return self.alias.get(tid, tid)
+
+    def _find_match(self, box, center, now):
+        # duplicate box on someone already present?
+        for cid, p in self.people.items():
+            if p['present'] and iou(box, p['box']) > 0.4:
+                return cid, 'duplicate of'
+        # recently lost (or momentarily unseen) track near this position?
+        best, best_d = None, self.W * 0.3
+        for cid, p in self.people.items():
+            if now - p['last'] > self.reid_window:
+                continue
+            d = math.hypot(center[0] - p['center'][0], center[1] - p['center'][1])
+            if d < best_d:
+                best, best_d = cid, d
+        return best, 're-acquired as'
+
+    def update(self, ids, centers, boxes, now):
         seen = set()
-        for tid, c in zip(ids, centers):
-            seen.add(tid)
-            p = self.people.get(tid)
+        for tid, c, box in zip(ids, centers, boxes):
+            if tid not in self.alias and tid not in self.people:
+                match, how = self._find_match(box, c, now)
+                if match is not None:
+                    self.alias[tid] = match
+                    log('ID {} {} ID {} (same person)'.format(tid, how, match))
+            cid = self.resolve(tid)
+            if cid in seen:
+                continue                       # two boxes for one person this frame
+            seen.add(cid)
+            p = self.people.get(cid)
             if p is None:
-                self.people[tid] = {'first': now, 'last': now, 'total': 0.0,
-                                    'present': True, 'center': c, 'prev_center': None}
-                log('ID {} entered the frame'.format(tid))
+                self.people[cid] = {'first': now, 'last': now, 'total': 0.0, 'present': True,
+                                    'center': c, 'box': box, 'prev_center': None}
+                log('ID {} entered the frame'.format(cid))
             else:
                 gap = now - p['last']
                 if gap <= self.gap_limit:
                     p['total'] += gap
                 elif not p['present']:
-                    log('ID {} re-entered the frame (was away {})'.format(tid, fmt_dur(gap)))
+                    log('ID {} re-entered the frame (was away {})'.format(cid, fmt_dur(gap)))
                 p['last'] = now
                 p['present'] = True
                 p['center'] = c
-        for tid, p in self.people.items():
-            if tid not in seen and p['present'] and now - p['last'] > self.gap_limit:
+                p['box'] = box
+        for cid, p in self.people.items():
+            if cid not in seen and p['present'] and now - p['last'] > self.gap_limit:
                 p['present'] = False
                 log('ID {} left the frame - visible {} (first {}, last {})'.format(
-                    tid, fmt_dur(p['total']), fmt_clock(p['first']), fmt_clock(p['last'])))
+                    cid, fmt_dur(p['total']), fmt_clock(p['first']), fmt_clock(p['last'])))
 
     def present_ids(self):
         return [t for t, p in self.people.items() if p['present']]
@@ -127,13 +167,13 @@ def posture(kp, kc, box):
 def track_people(frame, pose, device, args, tracker, now):
     """Run pose+ByteTrack, update timers. Returns the pose result."""
     pres = pose.track(frame, persist=True, device=device, conf=args.conf, imgsz=640,
-                      verbose=False, tracker='bytetrack.yaml')[0]
-    ids, centers = [], []
+                      verbose=False, tracker='bytetrack_custom.yaml')[0]
+    ids, centers, boxes = [], [], []
     if pres.boxes.id is not None:
         for b, tid in zip(pres.boxes, pres.boxes.id.int().tolist()):
             x1, y1, x2, y2 = map(int, b.xyxy[0])
-            ids.append(tid); centers.append(((x1 + x2) / 2, (y1 + y2) / 2))
-    tracker.update(ids, centers, now)
+            ids.append(tid); centers.append(((x1 + x2) / 2, (y1 + y2) / 2)); boxes.append((x1, y1, x2, y2))
+    tracker.update(ids, centers, boxes, now)
     return pres
 
 def analyse(frame, pres, det, emo, device, args, tracker, W, now):
@@ -150,7 +190,13 @@ def analyse(frame, pres, det, emo, device, args, tracker, W, now):
 
     people = []
     ids = pres.boxes.id.int().tolist() if pres.boxes.id is not None else [None] * len(pres.boxes)
+    shown = set()
     for i, (b, tid) in enumerate(zip(pres.boxes, ids)):
+        tid = tracker.resolve(tid) if tid is not None else None
+        if tid is not None:
+            if tid in shown:
+                continue
+            shown.add(tid)
         box = tuple(map(int, b.xyxy[0]))
         pconf = float(b.conf[0])
         kp = pres.keypoints.xy[i].cpu().numpy()
@@ -239,7 +285,7 @@ def main():
     log('Warming up GPU (first inference can take 30-90 s) ...')
     t0 = time.time()
     det.predict(frame, device=device, verbose=False, imgsz=640)
-    pose.track(frame, persist=True, device=device, verbose=False, imgsz=640, tracker='bytetrack.yaml')
+    pose.track(frame, persist=True, device=device, verbose=False, imgsz=640, tracker='bytetrack_custom.yaml')
     log('Warm-up done in {:.1f} s'.format(time.time() - t0))
     try:
         log('Detector running on: {}'.format(det.predictor.model.device))
@@ -247,7 +293,7 @@ def main():
     except Exception:
         log('Weights device: n/a (TensorRT engine)')
 
-    tracker = PersonTracker(gap_limit=args.gap)
+    tracker = PersonTracker(gap_limit=args.gap, frame_w=W)
     pres = None
     now = time.time()
     next_track = now

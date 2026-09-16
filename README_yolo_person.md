@@ -253,7 +253,7 @@ python3 -u yolo_person.py --cam 0 --save               # different camera
 | Output | Model | Notes |
 |--------|-------|-------|
 | All objects (chair, laptop, cup, dog, …) | YOLO11n | 80 COCO classes, counted per class |
-| Person tracking: persistent `ID N`, first seen, last seen, total visible time | YOLO11n-pose + ByteTrack | Tracking runs every 0.5 s; time accumulates only while continuously detected; `left the frame` after `--gap` seconds unseen |
+| Person tracking: persistent `ID N`, first seen, last seen, total visible time | YOLO11n-pose + ByteTrack + position-based merging | Tracking runs every 0.5 s; raw tracker IDs that are the same person are merged into one canonical ID; time accumulates only while continuously detected; `left the frame` after `--gap` seconds unseen |
 | Person pose: skeleton on image, torso angle, visible keypoints /17, movement in px | YOLO11n-pose | 17 COCO keypoints; angle measured from horizontal (≈90° = upright) |
 | Person activity: `active`, `still / resting`, `lying / sleeping?` | YOLO11n-pose | From torso angle (< 35° = lying) and movement between checks |
 | Facial expression: neutral, happy, surprised, sad, angry, disgusted, fearful, contempt | emotion-ferplus (ONNX, 64×64, run with OpenCV DNN) | Face located from pose keypoints; needs a roughly frontal face ≥ 40 px |
@@ -266,6 +266,13 @@ How states are decided:
 - **active** — upright and moved more than that, or seen for the first time.
 
 How timing works: the pose model runs with ByteTrack every `--track-interval` (0.5 s) and assigns each person an ID that persists while they stay in view. Each update adds the elapsed time to that ID's total, but only if the gap since the previous sighting is under `--gap` (10 s) — so brief dropouts (turning away, occlusion) don't count and don't end the session. When an ID is unseen for more than `--gap` seconds the script logs `ID N left the frame` with the total; if the tracker re-acquires the same ID later it logs a re-entry. On Ctrl+C a per-ID session summary is printed. The heavier full analysis (objects, expression, log line, `latest.jpg`) still runs every `--interval` (5 s).
+
+Why IDs are merged: ByteTrack matches boxes by overlap and motion only — it has no idea what a person looks like. Any break in the box-to-box chain (turning away, a hand over the face, a confidence dip, a second partial box on the same body) makes it start a new track number, and tentative tracks that die within a few frames consume numbers without ever being reported. In a first test a single person at a desk produced IDs 1, 4, 9, 17 and 19 over 20 minutes. The script therefore keeps its own *canonical* IDs and merges a new tracker ID into an existing record when either:
+
+- its box overlaps a currently present person by IoU > 0.4 — a **duplicate box** (logged `ID 19 duplicate of ID 4 (same person)`), or
+- it appears within 30 % of the frame width of where a person was last seen in the past 60 s — an **ID switch** (logged `ID 4 re-acquired as ID 1 (same person)`).
+
+All log lines, the image tags and the session summary use canonical IDs, so one person stays `ID 1` for the whole session. The rule is deliberately simple; two people swapping seats within a minute could be merged. Lower `reid_window` in `PersonTracker.__init__` (or add face recognition) for busy rooms.
 
 ## Extra setup
 
@@ -280,17 +287,36 @@ python3 -c "from ultralytics import YOLO; YOLO('yolo11n-pose.pt')"      # downlo
 
 If the `wget` URL has moved, search GitHub for `emotion-ferplus-8.onnx` in the ONNX Model Zoo. The script runs without it and simply skips the expression column.
 
+## Create the tracker config
+
+ByteTrack's defaults are tuned for 30 fps video; at one update every 0.5 s they drop tracks too quickly. Paste this into the SSH terminal:
+
+```bash
+mkdir -p ~/projects/led && cd ~/projects/led
+
+cat > bytetrack_custom.yaml << 'EOF2'
+tracker_type: bytetrack
+track_high_thresh: 0.5
+track_low_thresh: 0.1
+new_track_thresh: 0.65     # need a confident box to start a brand-new track (default 0.6)
+track_buffer: 60           # tracked frames to keep a lost track (60 x 0.5 s = 30 s; default 30)
+match_thresh: 0.85         # looser box matching (default 0.8)
+fuse_score: True
+EOF2
+```
+
 ## Create the script
 
 Paste into the SSH terminal:
 
 ```bash
-mkdir -p ~/projects/led && cd ~/projects/led
+cd ~/projects/led
 
 cat > yolo_scene.py << 'EOF2'
 """
 Scene understanding from a USB camera on Jetson Xavier NX:
   - every TRACK_INTERVAL (0.5 s): pose model with ByteTrack -> persistent person IDs, timers
+    (tracker IDs that are clearly the same person are merged, see PersonTracker)
   - every INTERVAL (5 s): all objects (YOLO11n), per-person activity, pose details,
     facial expression (emotion-ferplus via OpenCV DNN), visible-time per person,
     peak GPU utilisation / temperature / CUDA memory (jtop)
@@ -331,35 +357,74 @@ def gpu_load(jetson):
         v = jetson.stats.get('GPU', 0) or 0
         return v * 100 if v <= 1 else v
 
-class PersonTracker:
-    """Accumulates visible time per tracker ID."""
-    def __init__(self, gap_limit):
-        self.people = {}          # id -> dict(first, last, total, present, center)
-        self.gap_limit = gap_limit
+def iou(a, b):
+    ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
+    iw = max(0, min(ax2, bx2) - max(ax1, bx1)); ih = max(0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
 
-    def update(self, ids, centers, now):
+class PersonTracker:
+    """Accumulates visible time per person. Merges tracker IDs that are clearly the same person:
+    a new ID overlapping an existing track (duplicate box) or appearing where a recently
+    lost track was (ID switch) inherits that record instead of starting a new timer."""
+    def __init__(self, gap_limit, frame_w, reid_window=60.0):
+        self.people = {}          # canonical id -> record
+        self.alias = {}           # tracker id -> canonical id
+        self.gap_limit = gap_limit
+        self.W = frame_w
+        self.reid_window = reid_window
+
+    def resolve(self, tid):
+        return self.alias.get(tid, tid)
+
+    def _find_match(self, box, center, now):
+        # duplicate box on someone already present?
+        for cid, p in self.people.items():
+            if p['present'] and iou(box, p['box']) > 0.4:
+                return cid, 'duplicate of'
+        # recently lost (or momentarily unseen) track near this position?
+        best, best_d = None, self.W * 0.3
+        for cid, p in self.people.items():
+            if now - p['last'] > self.reid_window:
+                continue
+            d = math.hypot(center[0] - p['center'][0], center[1] - p['center'][1])
+            if d < best_d:
+                best, best_d = cid, d
+        return best, 're-acquired as'
+
+    def update(self, ids, centers, boxes, now):
         seen = set()
-        for tid, c in zip(ids, centers):
-            seen.add(tid)
-            p = self.people.get(tid)
+        for tid, c, box in zip(ids, centers, boxes):
+            if tid not in self.alias and tid not in self.people:
+                match, how = self._find_match(box, c, now)
+                if match is not None:
+                    self.alias[tid] = match
+                    log('ID {} {} ID {} (same person)'.format(tid, how, match))
+            cid = self.resolve(tid)
+            if cid in seen:
+                continue                       # two boxes for one person this frame
+            seen.add(cid)
+            p = self.people.get(cid)
             if p is None:
-                self.people[tid] = {'first': now, 'last': now, 'total': 0.0,
-                                    'present': True, 'center': c, 'prev_center': None}
-                log('ID {} entered the frame'.format(tid))
+                self.people[cid] = {'first': now, 'last': now, 'total': 0.0, 'present': True,
+                                    'center': c, 'box': box, 'prev_center': None}
+                log('ID {} entered the frame'.format(cid))
             else:
                 gap = now - p['last']
                 if gap <= self.gap_limit:
                     p['total'] += gap
                 elif not p['present']:
-                    log('ID {} re-entered the frame (was away {})'.format(tid, fmt_dur(gap)))
+                    log('ID {} re-entered the frame (was away {})'.format(cid, fmt_dur(gap)))
                 p['last'] = now
                 p['present'] = True
                 p['center'] = c
-        for tid, p in self.people.items():
-            if tid not in seen and p['present'] and now - p['last'] > self.gap_limit:
+                p['box'] = box
+        for cid, p in self.people.items():
+            if cid not in seen and p['present'] and now - p['last'] > self.gap_limit:
                 p['present'] = False
                 log('ID {} left the frame - visible {} (first {}, last {})'.format(
-                    tid, fmt_dur(p['total']), fmt_clock(p['first']), fmt_clock(p['last'])))
+                    cid, fmt_dur(p['total']), fmt_clock(p['first']), fmt_clock(p['last'])))
 
     def present_ids(self):
         return [t for t, p in self.people.items() if p['present']]
@@ -417,13 +482,13 @@ def posture(kp, kc, box):
 def track_people(frame, pose, device, args, tracker, now):
     """Run pose+ByteTrack, update timers. Returns the pose result."""
     pres = pose.track(frame, persist=True, device=device, conf=args.conf, imgsz=640,
-                      verbose=False, tracker='bytetrack.yaml')[0]
-    ids, centers = [], []
+                      verbose=False, tracker='bytetrack_custom.yaml')[0]
+    ids, centers, boxes = [], [], []
     if pres.boxes.id is not None:
         for b, tid in zip(pres.boxes, pres.boxes.id.int().tolist()):
             x1, y1, x2, y2 = map(int, b.xyxy[0])
-            ids.append(tid); centers.append(((x1 + x2) / 2, (y1 + y2) / 2))
-    tracker.update(ids, centers, now)
+            ids.append(tid); centers.append(((x1 + x2) / 2, (y1 + y2) / 2)); boxes.append((x1, y1, x2, y2))
+    tracker.update(ids, centers, boxes, now)
     return pres
 
 def analyse(frame, pres, det, emo, device, args, tracker, W, now):
@@ -440,7 +505,13 @@ def analyse(frame, pres, det, emo, device, args, tracker, W, now):
 
     people = []
     ids = pres.boxes.id.int().tolist() if pres.boxes.id is not None else [None] * len(pres.boxes)
+    shown = set()
     for i, (b, tid) in enumerate(zip(pres.boxes, ids)):
+        tid = tracker.resolve(tid) if tid is not None else None
+        if tid is not None:
+            if tid in shown:
+                continue
+            shown.add(tid)
         box = tuple(map(int, b.xyxy[0]))
         pconf = float(b.conf[0])
         kp = pres.keypoints.xy[i].cpu().numpy()
@@ -529,7 +600,7 @@ def main():
     log('Warming up GPU (first inference can take 30-90 s) ...')
     t0 = time.time()
     det.predict(frame, device=device, verbose=False, imgsz=640)
-    pose.track(frame, persist=True, device=device, verbose=False, imgsz=640, tracker='bytetrack.yaml')
+    pose.track(frame, persist=True, device=device, verbose=False, imgsz=640, tracker='bytetrack_custom.yaml')
     log('Warm-up done in {:.1f} s'.format(time.time() - t0))
     try:
         log('Detector running on: {}'.format(det.predictor.model.device))
@@ -537,7 +608,7 @@ def main():
     except Exception:
         log('Weights device: n/a (TensorRT engine)')
 
-    tracker = PersonTracker(gap_limit=args.gap)
+    tracker = PersonTracker(gap_limit=args.gap, frame_w=W)
     pres = None
     now = time.time()
     next_track = now
@@ -664,6 +735,10 @@ Expected output:
 [08:10:25] 268 ms | GPU peak 61% @ 41C | CUDA mem 22 MB | RAM 47% | 1 person(s) present | objects: chair, cup, keyboard
 [08:10:25]    ID 1 | visible 9s (since 08:10:16) | conf 84% | still / resting | pose: torso 86 deg, 14/17 kpts, moved 6 px | neutral 88%
 ...
+[08:11:02] ID 4 re-acquired as ID 1 (same person)
+[08:11:07] 124 ms | GPU peak 60% @ 41C | CUDA mem 22 MB | RAM 47% | 1 person(s) present | objects: chair, cup, keyboard
+[08:11:07]    ID 1 | visible 51s (since 08:10:16) | conf 89% | active | pose: 11/17 kpts, torso not visible, moved 56 px | neutral 85%
+...
 [08:12:51] ID 1 left the frame - visible 2m 35s (first 08:10:16, last 08:12:41)
 ^C
 [08:13:02] Stopped by user
@@ -683,7 +758,7 @@ In `latest.jpg`: other objects have YOLO's colored boxes and labels, each person
 |------|---------|---------|
 | `--cam N` or path | 0 | Camera index (`/dev/videoN`) or a `/dev/v4l/by-id/...` path |
 | `--det FILE` | `yolo11n.pt` | Object model (`.pt` or `.engine`) |
-| `--pose FILE` | `yolo11n-pose.pt` | Pose model (`.pt` or `.engine`) |
+| `--pose FILE` | `yolo11n-pose.pt` | Pose model (`.pt` or `.engine`); tracked with `bytetrack_custom.yaml` |
 | `--emo FILE` | `emotion-ferplus-8.onnx` | Expression model; skipped if missing |
 | `--interval S` | 5.0 | Seconds between full analyses (objects, expression, log line, image) |
 | `--track-interval S` | 0.5 | Seconds between tracking updates (person IDs and timers) |
@@ -772,8 +847,14 @@ That is onnxruntime aborting on a Jetson with CPU cores offline (2-core power mo
 **`nproc` shows 2**
 The board is in a 2-core power mode (`nvpmodel -m 0` puts it there). See Power mode above.
 
-**Same person gets a new ID after leaving and coming back**
-Expected. ByteTrack matches by position and motion, not appearance, and drops a track after ~30 tracked frames (≈15 s at the 0.5 s cadence). Re-identifying the same person across longer absences needs a face-recognition step, which this script does not include. Raise `--gap` if people are being marked as left during short occlusions.
+**Session summary shows many IDs for one person (e.g. 1, 4, 9, 17, 19)**
+That was the raw ByteTrack behaviour before merging was added: ID switches on brief occlusions, duplicate boxes on one body, and short-lived flickers, with skipped numbers being tentative tracks that never got confirmed. The current script merges those into canonical IDs (see "Why IDs are merged") and uses `bytetrack_custom.yaml`, which keeps lost tracks for 30 s and needs a more confident box to start a new one. If you still see fragmentation, make sure the YAML file exists in `~/projects/led` and that the log shows `duplicate of` / `re-acquired as` lines when it happens.
+
+**Same person gets a new ID after a long absence**
+Expected if they were gone for more than 60 s (the `reid_window`) — position-based merging can't know it is the same person. Re-identifying people across long gaps needs a face-recognition step, which this script does not include.
+
+**Two different people merged into one ID**
+They swapped places within the 60 s window. Lower `reid_window` in `PersonTracker.__init__`, or raise `new_track_thresh` in the YAML so weak boxes don't trigger a merge.
 
 **`ModuleNotFoundError: No module named 'lap'` or a tracker error at warm-up**
 `pip3 install lap`. ByteTrack uses it for detection-to-track matching.
