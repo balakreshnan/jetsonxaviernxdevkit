@@ -3,6 +3,7 @@ Scene understanding from a USB camera on Jetson Xavier NX, every INTERVAL second
   - all objects (YOLO11n)
   - per person: posture/activity from keypoints (YOLO11n-pose)
   - per person: facial expression (emotion-ferplus ONNX via OpenCV DNN) if the face is visible
+  - pose details (torso angle, visible keypoints, movement) per person, skeleton drawn on the image
   - peak GPU utilisation, temperature and CUDA memory on every summary line (jtop)
 Prints a summary and writes latest.jpg (or shows a window).
 """
@@ -23,6 +24,15 @@ L_SHO, R_SHO, L_HIP, R_HIP = 5, 6, 11, 12
 
 def log(msg):
     print('[{}] {}'.format(time.strftime('%H:%M:%S'), msg), flush=True)
+
+def gpu_load(jetson):
+    """GPU load in percent; jtop 4.x reports fractions in some places."""
+    try:
+        g = next(iter(jetson.gpu.values()))
+        return float(g['status']['load'])
+    except Exception:
+        v = jetson.stats.get('GPU', 0) or 0
+        return v * 100 if v <= 1 else v
 
 def load_emotion_model(path):
     if not os.path.exists(path):
@@ -75,8 +85,8 @@ def posture(kp, kc, box):
         hip = (kp[L_HIP] + kp[R_HIP]) / 2
         dx, dy = hip[0] - sho[0], hip[1] - sho[1]
         angle = abs(math.degrees(math.atan2(abs(dy), abs(dx))))   # 90 = vertical torso
-        return 'lying' if angle < 35 else 'upright'
-    return 'lying' if (x2 - x1) > 1.3 * (y2 - y1) else 'upright'
+        return ('lying' if angle < 35 else 'upright'), angle
+    return ('lying' if (x2 - x1) > 1.3 * (y2 - y1) else 'upright'), None
 
 def match_previous(center, prev, max_dist):
     best, best_d = None, max_dist
@@ -97,6 +107,8 @@ def analyse(frame, det, pose, emo, device, args, prev_centers, W):
 
     pres = pose.predict(frame, device=device, conf=args.conf, imgsz=640, verbose=False)[0]
     annotated = dres.plot()
+    if len(pres.boxes):
+        annotated = pres.plot(img=annotated, boxes=False, labels=False, kpt_radius=4, kpt_line=True)
     people, centers = [], []
     for i, b in enumerate(pres.boxes):
         box = tuple(map(int, b.xyxy[0]))
@@ -104,7 +116,7 @@ def analyse(frame, det, pose, emo, device, args, prev_centers, W):
         kp = pres.keypoints.xy[i].cpu().numpy()
         kc = pres.keypoints.conf[i].cpu().numpy() if pres.keypoints.conf is not None else np.ones(17)
 
-        post = posture(kp, kc, box)
+        post, angle = posture(kp, kc, box)
         center = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
         centers.append(center)
         _, dist = match_previous(center, prev_centers, max_dist=W * 0.4)
@@ -124,7 +136,12 @@ def analyse(frame, det, pose, emo, device, args, prev_centers, W):
                 mood = '{} {:.0%}'.format(label, p)
                 cv2.rectangle(annotated, fbox[:2], fbox[2:], (255, 200, 0), 1)
 
-        people.append('person {:.0%} | {}{}'.format(pconf, state, ' | ' + mood if mood else ''))
+        visible = int((kc > 0.3).sum())
+        pose_txt = ('torso {:.0f} deg, {}/17 kpts'.format(angle, visible) if angle is not None
+                    else '{}/17 kpts, torso not visible'.format(visible))
+        if prev_centers and dist < W * 0.4:
+            pose_txt += ', moved {:.0f} px'.format(dist)
+        people.append('person {:.0%} | {} | pose: {}{}'.format(pconf, state, pose_txt, ' | ' + mood if mood else ''))
         cv2.rectangle(annotated, box[:2], box[2:], (0, 255, 0), 2)
         y = max(15, box[1] - 8)
         cv2.putText(annotated, '{}{}'.format(state, ' / ' + mood if mood else ''),
@@ -133,7 +150,7 @@ def analyse(frame, det, pose, emo, device, args, prev_centers, W):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--cam', type=int, default=1)
+    ap.add_argument('--cam', default='0', help='camera index or /dev path (e.g. /dev/v4l/by-id/...)')
     ap.add_argument('--det', default='yolo11n.pt', help='object model (.pt or .engine)')
     ap.add_argument('--pose', default='yolo11n-pose.pt', help='pose model (.pt or .engine)')
     ap.add_argument('--emo', default='emotion-ferplus-8.onnx', help='emotion ONNX model')
@@ -154,8 +171,9 @@ def main():
     emo = load_emotion_model(args.emo)
     log('Models loaded')
 
-    log('Opening camera /dev/video{} ...'.format(args.cam))
-    cap = cv2.VideoCapture(args.cam, cv2.CAP_V4L2)
+    log('Opening camera {} ...'.format(args.cam))
+    cam = int(args.cam) if str(args.cam).isdigit() else args.cam
+    cap = cv2.VideoCapture(cam, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     ok, frame = cap.read()
@@ -170,8 +188,8 @@ def main():
     pose.predict(frame, device=device, verbose=False, imgsz=640)
     log('Warm-up done in {:.1f} s'.format(time.time() - t0))
     try:
-        log('Detector weights on: {}'.format(next(det.model.parameters()).device))
-        log('Pose weights on:     {}'.format(next(pose.model.parameters()).device))
+        log('Detector running on: {}'.format(det.predictor.model.device))
+        log('Pose running on:     {}'.format(pose.predictor.model.device))
     except Exception:
         log('Weights device: n/a (TensorRT engine)')
 
@@ -185,7 +203,7 @@ def main():
                 ok, frame = cap.read()
                 if not ok:
                     time.sleep(0.5); continue
-                gpu_peak = max(gpu_peak, jetson.stats['GPU'])
+                gpu_peak = max(gpu_peak, gpu_load(jetson))
                 if time.time() < next_run:
                     continue
                 next_run = time.time() + args.interval
@@ -196,7 +214,7 @@ def main():
                 ms = (time.time() - t0) * 1000
 
                 st = jetson.stats
-                gpu_peak = max(gpu_peak, st['GPU'])
+                gpu_peak = max(gpu_peak, gpu_load(jetson))
                 gpu_mem = torch.cuda.memory_allocated() / 1e6 if device == 0 else 0
                 ram = st['RAM'] * 100 if st['RAM'] <= 1 else st['RAM']
                 obj_txt = ', '.join('{} x{}'.format(k, v) if v > 1 else k

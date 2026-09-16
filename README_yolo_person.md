@@ -1,9 +1,11 @@
 # YOLO Vision on Jetson Xavier NX
 
-Two scripts in `~/projects/led`, both reading the USB camera on `/dev/video1` and running on the Jetson GPU every 5 seconds:
+Two scripts in `~/projects/led`, both reading a USB camera and running on the Jetson GPU (CUDA) every 5 seconds:
 
 - **`yolo_person.py`** — person detection only. Small, fast, a good first test.
-- **`yolo_scene.py`** — everything: all 80 COCO objects, per-person activity (active / still / lying-sleeping) and facial expression, plus GPU utilisation, temperature and CUDA memory on every log line.
+- **`yolo_scene.py`** — everything: all 80 COCO objects, per-person pose (skeleton, torso angle, keypoints, movement), activity (active / still / lying-sleeping) and facial expression, plus GPU utilisation, temperature and CUDA memory on every log line.
+
+USB cameras get renumbered after a reboot or re-plug, so always check `ls /dev/video*` first. `yolo_person.py` defaults to `/dev/video1`; `yolo_scene.py` defaults to `/dev/video0` and also accepts a stable `/dev/v4l/by-id/...` path.
 
 Both print what they found and write the annotated frame to `latest.jpg` (or show a live window when a display is available).
 
@@ -251,7 +253,8 @@ python3 -u yolo_person.py --cam 0 --save               # different camera
 | Output | Model | Notes |
 |--------|-------|-------|
 | All objects (chair, laptop, cup, dog, …) | YOLO11n | 80 COCO classes, counted per class |
-| Person activity: `active`, `still / resting`, `lying / sleeping?` | YOLO11n-pose | From torso angle and movement between checks |
+| Person pose: skeleton on image, torso angle, visible keypoints /17, movement in px | YOLO11n-pose | 17 COCO keypoints; angle measured from horizontal (≈90° = upright) |
+| Person activity: `active`, `still / resting`, `lying / sleeping?` | YOLO11n-pose | From torso angle (< 35° = lying) and movement between checks |
 | Facial expression: neutral, happy, surprised, sad, angry, disgusted, fearful, contempt | emotion-ferplus (ONNX, 64×64, run with OpenCV DNN) | Face located from pose keypoints; needs a roughly frontal face ≥ 40 px |
 | Peak GPU %, GPU temp, CUDA memory, RAM % | jtop + torch | On every summary line; GPU % is the peak over the whole interval |
 
@@ -287,6 +290,7 @@ Scene understanding from a USB camera on Jetson Xavier NX, every INTERVAL second
   - all objects (YOLO11n)
   - per person: posture/activity from keypoints (YOLO11n-pose)
   - per person: facial expression (emotion-ferplus ONNX via OpenCV DNN) if the face is visible
+  - pose details (torso angle, visible keypoints, movement) per person, skeleton drawn on the image
   - peak GPU utilisation, temperature and CUDA memory on every summary line (jtop)
 Prints a summary and writes latest.jpg (or shows a window).
 """
@@ -307,6 +311,15 @@ L_SHO, R_SHO, L_HIP, R_HIP = 5, 6, 11, 12
 
 def log(msg):
     print('[{}] {}'.format(time.strftime('%H:%M:%S'), msg), flush=True)
+
+def gpu_load(jetson):
+    """GPU load in percent; jtop 4.x reports fractions in some places."""
+    try:
+        g = next(iter(jetson.gpu.values()))
+        return float(g['status']['load'])
+    except Exception:
+        v = jetson.stats.get('GPU', 0) or 0
+        return v * 100 if v <= 1 else v
 
 def load_emotion_model(path):
     if not os.path.exists(path):
@@ -359,8 +372,8 @@ def posture(kp, kc, box):
         hip = (kp[L_HIP] + kp[R_HIP]) / 2
         dx, dy = hip[0] - sho[0], hip[1] - sho[1]
         angle = abs(math.degrees(math.atan2(abs(dy), abs(dx))))   # 90 = vertical torso
-        return 'lying' if angle < 35 else 'upright'
-    return 'lying' if (x2 - x1) > 1.3 * (y2 - y1) else 'upright'
+        return ('lying' if angle < 35 else 'upright'), angle
+    return ('lying' if (x2 - x1) > 1.3 * (y2 - y1) else 'upright'), None
 
 def match_previous(center, prev, max_dist):
     best, best_d = None, max_dist
@@ -381,6 +394,8 @@ def analyse(frame, det, pose, emo, device, args, prev_centers, W):
 
     pres = pose.predict(frame, device=device, conf=args.conf, imgsz=640, verbose=False)[0]
     annotated = dres.plot()
+    if len(pres.boxes):
+        annotated = pres.plot(img=annotated, boxes=False, labels=False, kpt_radius=4, kpt_line=True)
     people, centers = [], []
     for i, b in enumerate(pres.boxes):
         box = tuple(map(int, b.xyxy[0]))
@@ -388,7 +403,7 @@ def analyse(frame, det, pose, emo, device, args, prev_centers, W):
         kp = pres.keypoints.xy[i].cpu().numpy()
         kc = pres.keypoints.conf[i].cpu().numpy() if pres.keypoints.conf is not None else np.ones(17)
 
-        post = posture(kp, kc, box)
+        post, angle = posture(kp, kc, box)
         center = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
         centers.append(center)
         _, dist = match_previous(center, prev_centers, max_dist=W * 0.4)
@@ -408,7 +423,12 @@ def analyse(frame, det, pose, emo, device, args, prev_centers, W):
                 mood = '{} {:.0%}'.format(label, p)
                 cv2.rectangle(annotated, fbox[:2], fbox[2:], (255, 200, 0), 1)
 
-        people.append('person {:.0%} | {}{}'.format(pconf, state, ' | ' + mood if mood else ''))
+        visible = int((kc > 0.3).sum())
+        pose_txt = ('torso {:.0f} deg, {}/17 kpts'.format(angle, visible) if angle is not None
+                    else '{}/17 kpts, torso not visible'.format(visible))
+        if prev_centers and dist < W * 0.4:
+            pose_txt += ', moved {:.0f} px'.format(dist)
+        people.append('person {:.0%} | {} | pose: {}{}'.format(pconf, state, pose_txt, ' | ' + mood if mood else ''))
         cv2.rectangle(annotated, box[:2], box[2:], (0, 255, 0), 2)
         y = max(15, box[1] - 8)
         cv2.putText(annotated, '{}{}'.format(state, ' / ' + mood if mood else ''),
@@ -417,7 +437,7 @@ def analyse(frame, det, pose, emo, device, args, prev_centers, W):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--cam', type=int, default=1)
+    ap.add_argument('--cam', default='0', help='camera index or /dev path (e.g. /dev/v4l/by-id/...)')
     ap.add_argument('--det', default='yolo11n.pt', help='object model (.pt or .engine)')
     ap.add_argument('--pose', default='yolo11n-pose.pt', help='pose model (.pt or .engine)')
     ap.add_argument('--emo', default='emotion-ferplus-8.onnx', help='emotion ONNX model')
@@ -438,8 +458,9 @@ def main():
     emo = load_emotion_model(args.emo)
     log('Models loaded')
 
-    log('Opening camera /dev/video{} ...'.format(args.cam))
-    cap = cv2.VideoCapture(args.cam, cv2.CAP_V4L2)
+    log('Opening camera {} ...'.format(args.cam))
+    cam = int(args.cam) if str(args.cam).isdigit() else args.cam
+    cap = cv2.VideoCapture(cam, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     ok, frame = cap.read()
@@ -454,8 +475,8 @@ def main():
     pose.predict(frame, device=device, verbose=False, imgsz=640)
     log('Warm-up done in {:.1f} s'.format(time.time() - t0))
     try:
-        log('Detector weights on: {}'.format(next(det.model.parameters()).device))
-        log('Pose weights on:     {}'.format(next(pose.model.parameters()).device))
+        log('Detector running on: {}'.format(det.predictor.model.device))
+        log('Pose running on:     {}'.format(pose.predictor.model.device))
     except Exception:
         log('Weights device: n/a (TensorRT engine)')
 
@@ -469,7 +490,7 @@ def main():
                 ok, frame = cap.read()
                 if not ok:
                     time.sleep(0.5); continue
-                gpu_peak = max(gpu_peak, jetson.stats['GPU'])
+                gpu_peak = max(gpu_peak, gpu_load(jetson))
                 if time.time() < next_run:
                     continue
                 next_run = time.time() + args.interval
@@ -480,7 +501,7 @@ def main():
                 ms = (time.time() - t0) * 1000
 
                 st = jetson.stats
-                gpu_peak = max(gpu_peak, st['GPU'])
+                gpu_peak = max(gpu_peak, gpu_load(jetson))
                 gpu_mem = torch.cuda.memory_allocated() / 1e6 if device == 0 else 0
                 ram = st['RAM'] * 100 if st['RAM'] <= 1 else st['RAM']
                 obj_txt = ', '.join('{} x{}'.format(k, v) if v > 1 else k
@@ -538,32 +559,46 @@ sudo nvpmodel -d 2
 
 ## Run
 
+Find the camera, test which node streams, then run:
+
 ```bash
 cd ~/projects/led
-python3 -u yolo_scene.py --save
+ls /dev/video*
+python3 -c "
+import cv2
+for i in (0, 1):
+    cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
+    ok, f = cap.read()
+    print('/dev/video{}: {}'.format(i, 'frames OK {}x{}'.format(f.shape[1], f.shape[0]) if ok else 'no frames'))
+    cap.release()"
+python3 -u yolo_scene.py --cam 0 --save
 ```
+
+Most cameras expose two nodes; only the first streams. For a path that survives renumbering, use `ls -l /dev/v4l/by-id/` and pass it: `--cam /dev/v4l/by-id/usb-XXXX-video-index0`.
 
 Expected output:
 
 ```
-[17:05:03] Torch 1.12.0a0+2c916ef.nv22.3  device: GPU Xavier
-[17:05:03] Loading models ...
-[17:05:04] Emotion model loaded via OpenCV DNN (emotion-ferplus-8.onnx)
-[17:05:04] Models loaded
-[17:05:04] Opening camera /dev/video1 ...
-[17:05:06] Camera OK, frame 640x480
-[17:05:06] Warming up GPU (first inference can take 30-90 s) ...
-[17:05:18] Warm-up done in 12.7 s
-[17:05:18] Detector weights on: cuda:0
-[17:05:18] Pose weights on:     cuda:0
-[17:05:18] Analysing every 5.0 s. CTRL+C to stop.
-[17:05:23] 118 ms | GPU peak 71% @ 48C | CUDA mem 22 MB | RAM 78% | 1 person(s) | objects: chair, cup, keyboard
-[17:05:23]    person 84% | active | neutral 89%
-[17:05:28] 105 ms | GPU peak 66% @ 48C | CUDA mem 22 MB | RAM 78% | 1 person(s) | objects: cup, keyboard, potted plant
-[17:05:28]    person 85% | still / resting | neutral 91%
+[07:50:03] Torch 1.12.0a0+2c916ef.nv22.3  device: GPU Xavier
+[07:50:03] Loading models ...
+[07:50:04] Emotion model loaded via OpenCV DNN (emotion-ferplus-8.onnx)
+[07:50:04] Models loaded
+[07:50:04] Opening camera 0 ...
+[07:50:06] Camera OK, frame 640x480
+[07:50:06] Warming up GPU (first inference can take 30-90 s) ...
+[07:50:18] Warm-up done in 12.7 s
+[07:50:18] Detector running on: cuda:0
+[07:50:18] Pose running on:     cuda:0
+[07:50:18] Analysing every 5.0 s. CTRL+C to stop.
+[07:50:23] 275 ms | GPU peak 58% @ 40C | CUDA mem 22 MB | RAM 47% | 1 person(s) | objects: chair, cup, keyboard
+[07:50:23]    person 84% | active | pose: torso 86 deg, 14/17 kpts | neutral 89%
+[07:50:28] 268 ms | GPU peak 61% @ 40C | CUDA mem 22 MB | RAM 47% | 1 person(s) | objects: cup, keyboard, potted plant
+[07:50:28]    person 85% | still / resting | pose: torso 85 deg, 14/17 kpts, moved 7 px | neutral 91%
 ```
 
-`Detector weights on: cuda:0` (printed after warm-up, because Ultralytics only moves weights to the GPU on the first inference) is the definitive proof the models are on the GPU. `GPU peak` is the highest jtop reading seen during the whole interval, so it reflects the inference burst rather than the idle gap between checks. For a live view run `sudo jtop` (or `tegrastats --interval 1000` and watch `GR3D_FREQ`) in a second SSH window.
+`Detector running on: cuda:0` is the definitive proof the models run on the GPU. It reads `det.predictor.model.device` — the copy Ultralytics actually runs inference with — not `det.model`, which stays on CPU and misleadingly reports `cpu`. `GPU peak` is the highest jtop load seen during the whole interval (read from `jetson.gpu[...]['status']['load']`, which is a true percentage), so it reflects the inference burst rather than the idle gap between checks. For a live view run `sudo jtop` (or `tegrastats --interval 1000` and watch `GR3D_FREQ`) in a second SSH window.
+
+Reading the pose field: `torso 86 deg` is the shoulder-to-hip angle from horizontal (≈90° upright, < 35° lying); `14/17 kpts` is how many of the 17 COCO keypoints were seen with confidence > 0.3 — at a desk it is usually the upper body only; `moved 7 px` is the person's centre displacement since the previous check and drives `active` vs `still`. The skeleton itself is drawn on each person in `latest.jpg`.
 
 In `latest.jpg`: other objects have YOLO's colored boxes and labels, each person has a green box labeled with state and expression, and a thin yellow square marks the face crop used for the expression estimate.
 
@@ -571,7 +606,7 @@ In `latest.jpg`: other objects have YOLO's colored boxes and labels, each person
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--cam N` | 1 | Camera index (`/dev/videoN`) |
+| `--cam N` or path | 0 | Camera index (`/dev/videoN`) or a `/dev/v4l/by-id/...` path |
 | `--det FILE` | `yolo11n.pt` | Object model (`.pt` or `.engine`) |
 | `--pose FILE` | `yolo11n-pose.pt` | Pose model (`.pt` or `.engine`) |
 | `--emo FILE` | `emotion-ferplus-8.onnx` | Expression model; skipped if missing |
@@ -643,10 +678,16 @@ Check `sudo jtop` — GPU should be active during inference. Confirm the `device
 The jtop client and service differ. `sudo pip3 install "jetson-stats==4.3.2" && sudo systemctl restart jtop.service`, then rerun.
 
 **`Detector weights on: cpu` in the log**
-Only happens with an old version of the script that printed the device before warm-up. Ultralytics keeps weights on CPU until the first `predict()`; the current script checks after warm-up. `CUDA mem 22 MB` and the speed check above are the real indicators.
+Old version of the script checked `det.model`, which Ultralytics never moves — inference runs on `det.predictor.model`. The current script reports `Detector running on: cuda:0`. `CUDA mem 22 MB` and the speed check above are the other indicators.
 
-**`GPU 0.0%` on every line**
-Old version of the script sampled jtop once, right after the 100–300 ms burst. The current script reports the peak over the interval. Use `sudo jtop` for a live view.
+**`GPU peak 0%` on every line**
+Old version read `jetson.stats['GPU']`, which jtop 4.x returns as a fraction (0.0–1.0), so it rounded to 0. The current script reads the percentage from `jetson.gpu`. Use `sudo jtop` for a live view.
+
+**No pose / skeleton visible**
+Old version used the pose model only for the activity decision. The current script prints `pose: torso … kpts … moved …` per person and draws the skeleton with `pres.plot(img=annotated, ...)`.
+
+**`can't open camera by index` / `Cannot read camera 1`**
+The camera moved to another `/dev/videoN` after a reboot or re-plug. Run `ls /dev/video*` and the two-node test in the Run section, then pass `--cam 0` (or the `/dev/v4l/by-id/...` path).
 
 **`pthread_setaffinity_np failed` / `Assertion '__n < this->size()' failed` / `Aborted (core dumped)` at "Loading models"**
 That is onnxruntime aborting on a Jetson with CPU cores offline (2-core power mode). Two fixes, both applied here: bring all cores online (see Power mode), and run the ONNX model through `cv2.dnn` instead of onnxruntime. If you still have onnxruntime installed, `pip3 uninstall -y onnxruntime` — the script does not need it.
