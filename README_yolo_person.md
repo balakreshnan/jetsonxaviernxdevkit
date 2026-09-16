@@ -3,7 +3,7 @@
 Two scripts in `~/projects/led`, both reading a USB camera and running on the Jetson GPU (CUDA) every 5 seconds:
 
 - **`yolo_person.py`** — person detection only. Small, fast, a good first test.
-- **`yolo_scene.py`** — everything: all 80 COCO objects, per-person pose (skeleton, torso angle, keypoints, movement), activity (active / still / lying-sleeping) and facial expression, plus GPU utilisation, temperature and CUDA memory on every log line.
+- **`yolo_scene.py`** — everything: all 80 COCO objects, per-person tracking with a persistent ID and how long each person has been visible (first seen, last seen, total), pose (skeleton, torso angle, keypoints, movement), activity (active / still / lying-sleeping) and facial expression, plus GPU utilisation, temperature and CUDA memory on every log line.
 
 USB cameras get renumbered after a reboot or re-plug, so always check `ls /dev/video*` first. `yolo_person.py` defaults to `/dev/video1`; `yolo_scene.py` defaults to `/dev/video0` and also accepts a stable `/dev/v4l/by-id/...` path.
 
@@ -246,13 +246,14 @@ python3 -u yolo_person.py --cam 0 --save               # different camera
 
 ---
 
-# Part 2 — `yolo_scene.py` (objects + activity + expression + GPU stats)
+# Part 2 — `yolo_scene.py` (objects + person tracking/timing + pose + activity + expression + GPU stats)
 
 ## What it detects
 
 | Output | Model | Notes |
 |--------|-------|-------|
 | All objects (chair, laptop, cup, dog, …) | YOLO11n | 80 COCO classes, counted per class |
+| Person tracking: persistent `ID N`, first seen, last seen, total visible time | YOLO11n-pose + ByteTrack | Tracking runs every 0.5 s; time accumulates only while continuously detected; `left the frame` after `--gap` seconds unseen |
 | Person pose: skeleton on image, torso angle, visible keypoints /17, movement in px | YOLO11n-pose | 17 COCO keypoints; angle measured from horizontal (≈90° = upright) |
 | Person activity: `active`, `still / resting`, `lying / sleeping?` | YOLO11n-pose | From torso angle (< 35° = lying) and movement between checks |
 | Facial expression: neutral, happy, surprised, sad, angry, disgusted, fearful, contempt | emotion-ferplus (ONNX, 64×64, run with OpenCV DNN) | Face located from pose keypoints; needs a roughly frontal face ≥ 40 px |
@@ -264,12 +265,14 @@ How states are decided:
 - **still / resting** — upright and the person's center moved less than `--move` (default 6 % of frame width) since the previous check.
 - **active** — upright and moved more than that, or seen for the first time.
 
+How timing works: the pose model runs with ByteTrack every `--track-interval` (0.5 s) and assigns each person an ID that persists while they stay in view. Each update adds the elapsed time to that ID's total, but only if the gap since the previous sighting is under `--gap` (10 s) — so brief dropouts (turning away, occlusion) don't count and don't end the session. When an ID is unseen for more than `--gap` seconds the script logs `ID N left the frame` with the total; if the tracker re-acquires the same ID later it logs a re-entry. On Ctrl+C a per-ID session summary is printed. The heavier full analysis (objects, expression, log line, `latest.jpg`) still runs every `--interval` (5 s).
+
 ## Extra setup
 
 No extra Python packages beyond Part 1 and `jetson-stats` — the expression model runs through OpenCV's built-in DNN module (onnxruntime is deliberately not used; see Troubleshooting).
 
 ```bash
-pip3 install "jetson-stats==4.3.2"
+pip3 install "jetson-stats==4.3.2" lap      # lap = matching library used by ByteTrack
 cd ~/projects/led
 wget -O emotion-ferplus-8.onnx https://github.com/onnx/models/raw/main/validated/vision/body_analysis/emotion_ferplus/model/emotion-ferplus-8.onnx
 python3 -c "from ultralytics import YOLO; YOLO('yolo11n-pose.pt')"      # downloads the pose model
@@ -286,12 +289,11 @@ mkdir -p ~/projects/led && cd ~/projects/led
 
 cat > yolo_scene.py << 'EOF2'
 """
-Scene understanding from a USB camera on Jetson Xavier NX, every INTERVAL seconds:
-  - all objects (YOLO11n)
-  - per person: posture/activity from keypoints (YOLO11n-pose)
-  - per person: facial expression (emotion-ferplus ONNX via OpenCV DNN) if the face is visible
-  - pose details (torso angle, visible keypoints, movement) per person, skeleton drawn on the image
-  - peak GPU utilisation, temperature and CUDA memory on every summary line (jtop)
+Scene understanding from a USB camera on Jetson Xavier NX:
+  - every TRACK_INTERVAL (0.5 s): pose model with ByteTrack -> persistent person IDs, timers
+  - every INTERVAL (5 s): all objects (YOLO11n), per-person activity, pose details,
+    facial expression (emotion-ferplus via OpenCV DNN), visible-time per person,
+    peak GPU utilisation / temperature / CUDA memory (jtop)
 Prints a summary and writes latest.jpg (or shows a window).
 """
 import argparse
@@ -305,21 +307,62 @@ from ultralytics import YOLO
 from jtop import jtop
 
 EMOTIONS = ['neutral', 'happy', 'surprised', 'sad', 'angry', 'disgusted', 'fearful', 'contempt']
-# COCO keypoint indices
 NOSE, L_EYE, R_EYE, L_EAR, R_EAR = 0, 1, 2, 3, 4
 L_SHO, R_SHO, L_HIP, R_HIP = 5, 6, 11, 12
 
 def log(msg):
     print('[{}] {}'.format(time.strftime('%H:%M:%S'), msg), flush=True)
 
+def fmt_dur(sec):
+    sec = int(round(sec))
+    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+    if h: return '{}h {:02d}m {:02d}s'.format(h, m, s)
+    if m: return '{}m {:02d}s'.format(m, s)
+    return '{}s'.format(s)
+
+def fmt_clock(t):
+    return time.strftime('%H:%M:%S', time.localtime(t))
+
 def gpu_load(jetson):
-    """GPU load in percent; jtop 4.x reports fractions in some places."""
     try:
         g = next(iter(jetson.gpu.values()))
         return float(g['status']['load'])
     except Exception:
         v = jetson.stats.get('GPU', 0) or 0
         return v * 100 if v <= 1 else v
+
+class PersonTracker:
+    """Accumulates visible time per tracker ID."""
+    def __init__(self, gap_limit):
+        self.people = {}          # id -> dict(first, last, total, present, center)
+        self.gap_limit = gap_limit
+
+    def update(self, ids, centers, now):
+        seen = set()
+        for tid, c in zip(ids, centers):
+            seen.add(tid)
+            p = self.people.get(tid)
+            if p is None:
+                self.people[tid] = {'first': now, 'last': now, 'total': 0.0,
+                                    'present': True, 'center': c, 'prev_center': None}
+                log('ID {} entered the frame'.format(tid))
+            else:
+                gap = now - p['last']
+                if gap <= self.gap_limit:
+                    p['total'] += gap
+                elif not p['present']:
+                    log('ID {} re-entered the frame (was away {})'.format(tid, fmt_dur(gap)))
+                p['last'] = now
+                p['present'] = True
+                p['center'] = c
+        for tid, p in self.people.items():
+            if tid not in seen and p['present'] and now - p['last'] > self.gap_limit:
+                p['present'] = False
+                log('ID {} left the frame - visible {} (first {}, last {})'.format(
+                    tid, fmt_dur(p['total']), fmt_clock(p['first']), fmt_clock(p['last'])))
+
+    def present_ids(self):
+        return [t for t, p in self.people.items() if p['present']]
 
 def load_emotion_model(path):
     if not os.path.exists(path):
@@ -336,7 +379,6 @@ def load_emotion_model(path):
         return None
 
 def face_crop(frame, kp, kc, box):
-    """Estimate a face square from head keypoints; fall back to top of bbox."""
     h, w = frame.shape[:2]
     pts = [kp[i] for i in (NOSE, L_EYE, R_EYE, L_EAR, R_EAR) if kc[i] > 0.3]
     if len(pts) >= 2:
@@ -355,36 +397,36 @@ def face_crop(frame, kp, kc, box):
     return frame[ya:yb, xa:xb], (xa, ya, xb, yb)
 
 def emotion(net, face):
-    gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, (64, 64))
-    blob = cv2.dnn.blobFromImage(gray, scalefactor=1.0, size=(64, 64))   # 1x1x64x64 float32
-    net.setInput(blob)
+    gray = cv2.resize(cv2.cvtColor(face, cv2.COLOR_BGR2GRAY), (64, 64))
+    net.setInput(cv2.dnn.blobFromImage(gray, scalefactor=1.0, size=(64, 64)))
     logits = net.forward().flatten()
     p = np.exp(logits - logits.max()); p /= p.sum()
     i = int(p.argmax())
     return EMOTIONS[i], float(p[i])
 
 def posture(kp, kc, box):
-    """Return 'lying' or 'upright' from torso angle, falling back to box shape."""
     x1, y1, x2, y2 = box
     if min(kc[L_SHO], kc[R_SHO], kc[L_HIP], kc[R_HIP]) > 0.3:
         sho = (kp[L_SHO] + kp[R_SHO]) / 2
         hip = (kp[L_HIP] + kp[R_HIP]) / 2
         dx, dy = hip[0] - sho[0], hip[1] - sho[1]
-        angle = abs(math.degrees(math.atan2(abs(dy), abs(dx))))   # 90 = vertical torso
+        angle = abs(math.degrees(math.atan2(abs(dy), abs(dx))))
         return ('lying' if angle < 35 else 'upright'), angle
     return ('lying' if (x2 - x1) > 1.3 * (y2 - y1) else 'upright'), None
 
-def match_previous(center, prev, max_dist):
-    best, best_d = None, max_dist
-    for pc in prev:
-        d = math.hypot(center[0] - pc[0], center[1] - pc[1])
-        if d < best_d:
-            best, best_d = pc, d
-    return best, best_d
+def track_people(frame, pose, device, args, tracker, now):
+    """Run pose+ByteTrack, update timers. Returns the pose result."""
+    pres = pose.track(frame, persist=True, device=device, conf=args.conf, imgsz=640,
+                      verbose=False, tracker='bytetrack.yaml')[0]
+    ids, centers = [], []
+    if pres.boxes.id is not None:
+        for b, tid in zip(pres.boxes, pres.boxes.id.int().tolist()):
+            x1, y1, x2, y2 = map(int, b.xyxy[0])
+            ids.append(tid); centers.append(((x1 + x2) / 2, (y1 + y2) / 2))
+    tracker.update(ids, centers, now)
+    return pres
 
-def analyse(frame, det, pose, emo, device, args, prev_centers, W):
-    """Run both models on one frame. Returns (annotated, people, objects, centers)."""
+def analyse(frame, pres, det, emo, device, args, tracker, W, now):
     dres = det.predict(frame, device=device, conf=args.conf, imgsz=640, verbose=False)[0]
     objects = {}
     for b in dres.boxes:
@@ -392,12 +434,13 @@ def analyse(frame, det, pose, emo, device, args, prev_centers, W):
         if name != 'person':
             objects[name] = objects.get(name, 0) + 1
 
-    pres = pose.predict(frame, device=device, conf=args.conf, imgsz=640, verbose=False)[0]
     annotated = dres.plot()
     if len(pres.boxes):
         annotated = pres.plot(img=annotated, boxes=False, labels=False, kpt_radius=4, kpt_line=True)
-    people, centers = [], []
-    for i, b in enumerate(pres.boxes):
+
+    people = []
+    ids = pres.boxes.id.int().tolist() if pres.boxes.id is not None else [None] * len(pres.boxes)
+    for i, (b, tid) in enumerate(zip(pres.boxes, ids)):
         box = tuple(map(int, b.xyxy[0]))
         pconf = float(b.conf[0])
         kp = pres.keypoints.xy[i].cpu().numpy()
@@ -405,15 +448,25 @@ def analyse(frame, det, pose, emo, device, args, prev_centers, W):
 
         post, angle = posture(kp, kc, box)
         center = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
-        centers.append(center)
-        _, dist = match_previous(center, prev_centers, max_dist=W * 0.4)
-        moved = dist < W * 0.4 and dist > W * args.move
+        rec = tracker.people.get(tid) if tid is not None else None
+        dist = None
+        if rec is not None and rec['prev_center'] is not None:
+            dist = math.hypot(center[0] - rec['prev_center'][0], center[1] - rec['prev_center'][1])
+        if rec is not None:
+            rec['prev_center'] = center
+
         if post == 'lying':
             state = 'lying / sleeping?'
-        elif prev_centers and not moved:
+        elif dist is not None and dist < W * args.move:
             state = 'still / resting'
         else:
             state = 'active'
+
+        visible = int((kc > 0.3).sum())
+        pose_txt = ('torso {:.0f} deg, {}/17 kpts'.format(angle, visible) if angle is not None
+                    else '{}/17 kpts, torso not visible'.format(visible))
+        if dist is not None:
+            pose_txt += ', moved {:.0f} px'.format(dist)
 
         mood = ''
         if emo is not None:
@@ -423,28 +476,32 @@ def analyse(frame, det, pose, emo, device, args, prev_centers, W):
                 mood = '{} {:.0%}'.format(label, p)
                 cv2.rectangle(annotated, fbox[:2], fbox[2:], (255, 200, 0), 1)
 
-        visible = int((kc > 0.3).sum())
-        pose_txt = ('torso {:.0f} deg, {}/17 kpts'.format(angle, visible) if angle is not None
-                    else '{}/17 kpts, torso not visible'.format(visible))
-        if prev_centers and dist < W * 0.4:
-            pose_txt += ', moved {:.0f} px'.format(dist)
-        people.append('person {:.0%} | {} | pose: {}{}'.format(pconf, state, pose_txt, ' | ' + mood if mood else ''))
+        if rec is not None:
+            who = 'ID {} | visible {} (since {})'.format(tid, fmt_dur(rec['total']), fmt_clock(rec['first']))
+            tag = 'ID {}  {}'.format(tid, fmt_dur(rec['total']))
+        else:
+            who = 'untracked'; tag = '?'
+        people.append('{} | conf {:.0%} | {} | pose: {}{}'.format(
+            who, pconf, state, pose_txt, ' | ' + mood if mood else ''))
+
         cv2.rectangle(annotated, box[:2], box[2:], (0, 255, 0), 2)
-        y = max(15, box[1] - 8)
+        cv2.putText(annotated, tag, (box[0], max(15, box[1] - 26)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         cv2.putText(annotated, '{}{}'.format(state, ' / ' + mood if mood else ''),
-                    (box[0], y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-    return annotated, people, objects, centers
+                    (box[0], max(15, box[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+    return annotated, people, objects
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--cam', default='0', help='camera index or /dev path (e.g. /dev/v4l/by-id/...)')
-    ap.add_argument('--det', default='yolo11n.pt', help='object model (.pt or .engine)')
-    ap.add_argument('--pose', default='yolo11n-pose.pt', help='pose model (.pt or .engine)')
-    ap.add_argument('--emo', default='emotion-ferplus-8.onnx', help='emotion ONNX model')
-    ap.add_argument('--interval', type=float, default=5.0)
+    ap.add_argument('--cam', default='0', help='camera index or /dev path')
+    ap.add_argument('--det', default='yolo11n.pt')
+    ap.add_argument('--pose', default='yolo11n-pose.pt')
+    ap.add_argument('--emo', default='emotion-ferplus-8.onnx')
+    ap.add_argument('--interval', type=float, default=5.0, help='seconds between full analyses')
+    ap.add_argument('--track-interval', type=float, default=0.5, help='seconds between tracking updates')
+    ap.add_argument('--gap', type=float, default=10.0, help='seconds unseen before a person counts as left')
     ap.add_argument('--conf', type=float, default=0.4)
-    ap.add_argument('--move', type=float, default=0.06,
-                    help='movement threshold as fraction of frame width to count as active')
+    ap.add_argument('--move', type=float, default=0.06)
     ap.add_argument('--save', action='store_true')
     args = ap.parse_args()
 
@@ -472,7 +529,7 @@ def main():
     log('Warming up GPU (first inference can take 30-90 s) ...')
     t0 = time.time()
     det.predict(frame, device=device, verbose=False, imgsz=640)
-    pose.predict(frame, device=device, verbose=False, imgsz=640)
+    pose.track(frame, persist=True, device=device, verbose=False, imgsz=640, tracker='bytetrack.yaml')
     log('Warm-up done in {:.1f} s'.format(time.time() - t0))
     try:
         log('Detector running on: {}'.format(det.predictor.model.device))
@@ -480,52 +537,63 @@ def main():
     except Exception:
         log('Weights device: n/a (TensorRT engine)')
 
-    prev_centers = []
-    next_run = time.time()
+    tracker = PersonTracker(gap_limit=args.gap)
+    pres = None
+    now = time.time()
+    next_track = now
+    next_full = now
     gpu_peak = 0.0
-    log('Analysing every {} s. CTRL+C to stop.'.format(args.interval))
+    log('Tracking every {} s, full analysis every {} s. CTRL+C to stop.'.format(args.track_interval, args.interval))
     try:
         with jtop() as jetson:
             while jetson.ok():
                 ok, frame = cap.read()
                 if not ok:
                     time.sleep(0.5); continue
+                now = time.time()
                 gpu_peak = max(gpu_peak, gpu_load(jetson))
-                if time.time() < next_run:
-                    continue
-                next_run = time.time() + args.interval
 
-                t0 = time.time()
-                annotated, people, objects, prev_centers = analyse(
-                    frame, det, pose, emo, device, args, prev_centers, W)
-                ms = (time.time() - t0) * 1000
+                if now >= next_track:
+                    next_track = now + args.track_interval
+                    pres = track_people(frame, pose, device, args, tracker, now)
 
-                st = jetson.stats
-                gpu_peak = max(gpu_peak, gpu_load(jetson))
-                gpu_mem = torch.cuda.memory_allocated() / 1e6 if device == 0 else 0
-                ram = st['RAM'] * 100 if st['RAM'] <= 1 else st['RAM']
-                obj_txt = ', '.join('{} x{}'.format(k, v) if v > 1 else k
-                                    for k, v in sorted(objects.items())) or 'none'
-                log('{:.0f} ms | GPU peak {:.0f}% @ {:.0f}C | CUDA mem {:.0f} MB | RAM {:.0f}% | {} person(s) | objects: {}'.format(
-                    ms, gpu_peak, st['Temp GPU'], gpu_mem, ram, len(people), obj_txt))
-                for p in people:
-                    log('   ' + p)
+                if now >= next_full and pres is not None:
+                    next_full = now + args.interval
+                    t0 = time.time()
+                    annotated, people, objects = analyse(frame, pres, det, emo, device, args, tracker, W, now)
+                    ms = (time.time() - t0) * 1000
 
-                cv2.putText(annotated, '{} persons, {} objects | GPU peak {:.0f}%'.format(
-                    len(people), sum(objects.values()), gpu_peak),
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                gpu_peak = 0.0
-                if args.save:
-                    cv2.imwrite('latest.jpg', annotated)
-                else:
-                    cv2.imshow('Scene', annotated)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
+                    st = jetson.stats
+                    gpu_peak = max(gpu_peak, gpu_load(jetson))
+                    gpu_mem = torch.cuda.memory_allocated() / 1e6 if device == 0 else 0
+                    ram = st['RAM'] * 100 if st['RAM'] <= 1 else st['RAM']
+                    obj_txt = ', '.join('{} x{}'.format(k, v) if v > 1 else k
+                                        for k, v in sorted(objects.items())) or 'none'
+                    log('{:.0f} ms | GPU peak {:.0f}% @ {:.0f}C | CUDA mem {:.0f} MB | RAM {:.0f}% | {} person(s) present | objects: {}'.format(
+                        ms, gpu_peak, st['Temp GPU'], gpu_mem, ram, len(tracker.present_ids()), obj_txt))
+                    for p in people:
+                        log('   ' + p)
+
+                    cv2.putText(annotated, '{} present, {} objects | GPU peak {:.0f}%'.format(
+                        len(tracker.present_ids()), sum(objects.values()), gpu_peak),
+                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    gpu_peak = 0.0
+                    if args.save:
+                        cv2.imwrite('latest.jpg', annotated)
+                    else:
+                        cv2.imshow('Scene', annotated)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            break
     except KeyboardInterrupt:
         log('Stopped by user')
     finally:
         cap.release()
         cv2.destroyAllWindows()
+        log('---- Session summary ----')
+        for tid, p in sorted(tracker.people.items()):
+            log('ID {}: visible {} total, first seen {}, last seen {}{}'.format(
+                tid, fmt_dur(p['total']), fmt_clock(p['first']), fmt_clock(p['last']),
+                '' if p['present'] else ' (left)'))
 
 if __name__ == '__main__':
     main()
@@ -579,26 +647,33 @@ Most cameras expose two nodes; only the first streams. For a path that survives 
 Expected output:
 
 ```
-[07:50:03] Torch 1.12.0a0+2c916ef.nv22.3  device: GPU Xavier
-[07:50:03] Loading models ...
-[07:50:04] Emotion model loaded via OpenCV DNN (emotion-ferplus-8.onnx)
-[07:50:04] Models loaded
-[07:50:04] Opening camera 0 ...
-[07:50:06] Camera OK, frame 640x480
-[07:50:06] Warming up GPU (first inference can take 30-90 s) ...
-[07:50:18] Warm-up done in 12.7 s
-[07:50:18] Detector running on: cuda:0
-[07:50:18] Pose running on:     cuda:0
-[07:50:18] Analysing every 5.0 s. CTRL+C to stop.
-[07:50:23] 275 ms | GPU peak 58% @ 40C | CUDA mem 22 MB | RAM 47% | 1 person(s) | objects: chair, cup, keyboard
-[07:50:23]    person 84% | active | pose: torso 86 deg, 14/17 kpts | neutral 89%
-[07:50:28] 268 ms | GPU peak 61% @ 40C | CUDA mem 22 MB | RAM 47% | 1 person(s) | objects: cup, keyboard, potted plant
-[07:50:28]    person 85% | still / resting | pose: torso 85 deg, 14/17 kpts, moved 7 px | neutral 91%
+[08:10:00] Torch 1.12.0a0+2c916ef.nv22.3  device: GPU Xavier
+[08:10:00] Loading models ...
+[08:10:01] Emotion model loaded via OpenCV DNN (emotion-ferplus-8.onnx)
+[08:10:01] Models loaded
+[08:10:01] Opening camera 0 ...
+[08:10:03] Camera OK, frame 640x480
+[08:10:03] Warming up GPU (first inference can take 30-90 s) ...
+[08:10:15] Warm-up done in 12.7 s
+[08:10:15] Detector running on: cuda:0
+[08:10:15] Pose running on:     cuda:0
+[08:10:15] Tracking every 0.5 s, full analysis every 5.0 s. CTRL+C to stop.
+[08:10:16] ID 1 entered the frame
+[08:10:20] 271 ms | GPU peak 63% @ 41C | CUDA mem 22 MB | RAM 47% | 1 person(s) present | objects: cup, keyboard
+[08:10:20]    ID 1 | visible 4s (since 08:10:16) | conf 86% | active | pose: torso 85 deg, 14/17 kpts | neutral 90%
+[08:10:25] 268 ms | GPU peak 61% @ 41C | CUDA mem 22 MB | RAM 47% | 1 person(s) present | objects: chair, cup, keyboard
+[08:10:25]    ID 1 | visible 9s (since 08:10:16) | conf 84% | still / resting | pose: torso 86 deg, 14/17 kpts, moved 6 px | neutral 88%
+...
+[08:12:51] ID 1 left the frame - visible 2m 35s (first 08:10:16, last 08:12:41)
+^C
+[08:13:02] Stopped by user
+[08:13:02] ---- Session summary ----
+[08:13:02] ID 1: visible 2m 35s total, first seen 08:10:16, last seen 08:12:41 (left)
 ```
 
 `Detector running on: cuda:0` is the definitive proof the models run on the GPU. It reads `det.predictor.model.device` — the copy Ultralytics actually runs inference with — not `det.model`, which stays on CPU and misleadingly reports `cpu`. `GPU peak` is the highest jtop load seen during the whole interval (read from `jetson.gpu[...]['status']['load']`, which is a true percentage), so it reflects the inference burst rather than the idle gap between checks. For a live view run `sudo jtop` (or `tegrastats --interval 1000` and watch `GR3D_FREQ`) in a second SSH window.
 
-Reading the pose field: `torso 86 deg` is the shoulder-to-hip angle from horizontal (≈90° upright, < 35° lying); `14/17 kpts` is how many of the 17 COCO keypoints were seen with confidence > 0.3 — at a desk it is usually the upper body only; `moved 7 px` is the person's centre displacement since the previous check and drives `active` vs `still`. The skeleton itself is drawn on each person in `latest.jpg`.
+Reading the pose field: `torso 86 deg` is the shoulder-to-hip angle from horizontal (≈90° upright, < 35° lying); `14/17 kpts` is how many of the 17 COCO keypoints were seen with confidence > 0.3 — at a desk it is usually the upper body only; `moved 7 px` is the person's centre displacement since the previous check and drives `active` vs `still`. The skeleton itself is drawn on each person in `latest.jpg`, with a yellow `ID 1  2m 35s` tag above the green box showing the tracker ID and accumulated visible time.
 
 In `latest.jpg`: other objects have YOLO's colored boxes and labels, each person has a green box labeled with state and expression, and a thin yellow square marks the face crop used for the expression estimate.
 
@@ -610,7 +685,9 @@ In `latest.jpg`: other objects have YOLO's colored boxes and labels, each person
 | `--det FILE` | `yolo11n.pt` | Object model (`.pt` or `.engine`) |
 | `--pose FILE` | `yolo11n-pose.pt` | Pose model (`.pt` or `.engine`) |
 | `--emo FILE` | `emotion-ferplus-8.onnx` | Expression model; skipped if missing |
-| `--interval S` | 5.0 | Seconds between checks |
+| `--interval S` | 5.0 | Seconds between full analyses (objects, expression, log line, image) |
+| `--track-interval S` | 0.5 | Seconds between tracking updates (person IDs and timers) |
+| `--gap S` | 10.0 | Seconds a person can be unseen before counting as having left |
 | `--conf C` | 0.4 | Minimum detection confidence |
 | `--move F` | 0.06 | Movement threshold (fraction of frame width) for `active` |
 | `--save` | off | Write `latest.jpg` instead of a window |
@@ -694,6 +771,15 @@ That is onnxruntime aborting on a Jetson with CPU cores offline (2-core power mo
 
 **`nproc` shows 2**
 The board is in a 2-core power mode (`nvpmodel -m 0` puts it there). See Power mode above.
+
+**Same person gets a new ID after leaving and coming back**
+Expected. ByteTrack matches by position and motion, not appearance, and drops a track after ~30 tracked frames (≈15 s at the 0.5 s cadence). Re-identifying the same person across longer absences needs a face-recognition step, which this script does not include. Raise `--gap` if people are being marked as left during short occlusions.
+
+**`ModuleNotFoundError: No module named 'lap'` or a tracker error at warm-up**
+`pip3 install lap`. ByteTrack uses it for detection-to-track matching.
+
+**IDs jump around when someone moves quickly**
+Lower `--track-interval` (e.g. 0.25) so the tracker sees smaller displacements between updates.
 
 **Expression always "neutral" or missing**
 The face crop is too small or not frontal. Move closer to the camera (face ≥ 40 px wide) and face it; a thin yellow square in `latest.jpg` shows what the model saw.
